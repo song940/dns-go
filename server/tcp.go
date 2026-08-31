@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/tls"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -99,7 +100,7 @@ func handleTCPConn(conn net.Conn, h DNSHandler) {
 
 		// Create connection wrapper
 		pc := &PackConn{
-			Writer:     conn,
+			Writer:     &tcpResponseWriter{Writer: conn},
 			RemoteAddr: conn.RemoteAddr().String(),
 			Request:    req,
 		}
@@ -107,4 +108,38 @@ func handleTCPConn(conn net.Conn, h DNSHandler) {
 		// Handle query
 		h.HandleQuery(pc)
 	}
+}
+
+// tcpResponseWriter adds the two-byte message length required by DNS over
+// TCP and DNS over TLS. PackConn deliberately deals in raw DNS messages so
+// each transport is responsible for its own framing.
+type tcpResponseWriter struct {
+	io.Writer
+}
+
+func (w *tcpResponseWriter) Write(data []byte) (int, error) {
+	if len(data) > int(^uint16(0)) {
+		return 0, fmt.Errorf("DNS message too large for TCP framing: %d bytes", len(data))
+	}
+	frame := make([]byte, 2+len(data))
+	binary.BigEndian.PutUint16(frame[:2], uint16(len(data)))
+	copy(frame[2:], data)
+	if err := writeFull(w.Writer, frame); err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
+
+func writeFull(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }

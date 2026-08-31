@@ -73,7 +73,7 @@ import (
 
 func main() {
     // 创建 DoH 客户端
-    c := client.NewDoHClient("https://cloudflare-dns.com/dns-query")
+    c := client.NewHTTPClientPost("https://cloudflare-dns.com/dns-query")
     
     // 创建查询数据包
     query := packet.NewPacket()
@@ -373,11 +373,14 @@ type DNSResourceRecordCustom struct {
     CustomData string
 }
 
-func (r *DNSResourceRecordCustom) Decode(reader *bytes.Reader, length uint16) {
+func (r *DNSResourceRecordCustom) Decode(reader *bytes.Reader, length uint16) error {
     // 实现解码逻辑
     data := make([]byte, length)
-    reader.Read(data)
+    if _, err := io.ReadFull(reader, data); err != nil {
+        return err
+    }
     r.CustomData = string(data)
+    return nil
 }
 
 func (r *DNSResourceRecordCustom) Encode() []byte {

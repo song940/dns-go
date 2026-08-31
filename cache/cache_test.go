@@ -23,7 +23,7 @@ func newTestCache(t *testing.T, minTTL, maxTTL, negTTL time.Duration, max int) (
 
 type fakeClock struct{ t time.Time }
 
-func (f *fakeClock) Now() time.Time     { return f.t }
+func (f *fakeClock) Now() time.Time          { return f.t }
 func (f *fakeClock) Advance(d time.Duration) { f.t = f.t.Add(d) }
 
 func newAResponse(name string, ttl uint32) *packet.DNSPacket {
@@ -160,5 +160,89 @@ func TestHeaderIsolation(t *testing.T) {
 	got2, _ := c.Get(k)
 	if got2.Header.ID == 0xAAAA {
 		t.Error("cache entry header leaked between Get calls")
+	}
+}
+
+func TestRecordIsolationAndTTLAging(t *testing.T) {
+	c, clock := newTestCache(t, time.Second, time.Hour, time.Minute, 100)
+	k := keyForA("example.com")
+	c.Put(k, newAResponse("example.com", 300))
+
+	clock.Advance(45 * time.Second)
+	got1, ok := c.Get(k)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	a1 := got1.Answers[0].(*packet.DNSResourceRecordA)
+	if a1.TTL != 255 {
+		t.Fatalf("got aged TTL %d, want 255", a1.TTL)
+	}
+	a1.Address = "203.0.113.9"
+	a1.TTL = 1
+
+	got2, ok := c.Get(k)
+	if !ok {
+		t.Fatal("expected second cache hit")
+	}
+	a2 := got2.Answers[0].(*packet.DNSResourceRecordA)
+	if a2.Address != "1.2.3.4" || a2.TTL != 255 {
+		t.Fatalf("cached record was mutated: address=%s TTL=%d", a2.Address, a2.TTL)
+	}
+}
+
+func TestLRUEviction(t *testing.T) {
+	c, _ := newTestCache(t, time.Second, time.Hour, time.Minute, 2)
+	a := keyForA("a.com")
+	b := keyForA("b.com")
+	cKey := keyForA("c.com")
+	c.Put(a, newAResponse("a.com", 300))
+	c.Put(b, newAResponse("b.com", 300))
+	if _, ok := c.Get(a); !ok { // a becomes most recently used
+		t.Fatal("expected a.com cache hit")
+	}
+	c.Put(cKey, newAResponse("c.com", 300))
+
+	if _, ok := c.Get(b); ok {
+		t.Fatal("expected least recently used b.com to be evicted")
+	}
+	if _, ok := c.Get(a); !ok {
+		t.Fatal("expected recently used a.com to remain")
+	}
+}
+
+func TestCacheNamespaceIsolation(t *testing.T) {
+	c, _ := newTestCache(t, time.Second, time.Hour, time.Minute, 100)
+	q := &packet.DNSQuestion{Name: "example.com", Type: packet.DNSTypeA, Class: packet.DNSClassIN}
+	c.Put(KeyOfNamespace("profile-a", q), newAResponse("example.com", 300))
+
+	if _, ok := c.Get(KeyOfNamespace("profile-b", q)); ok {
+		t.Fatal("cache entry leaked across namespaces")
+	}
+	if _, ok := c.Get(KeyOfNamespace("profile-a", q)); !ok {
+		t.Fatal("expected hit in original namespace")
+	}
+}
+
+func TestModernRecordTTLHelpers(t *testing.T) {
+	base := func(rtype packet.DNSType) packet.DNSResourceRecord {
+		return packet.DNSResourceRecord{Name: "example.com", Type: rtype, Class: packet.DNSClassIN, TTL: 100}
+	}
+	records := []packet.DNSResource{
+		&packet.DNSResourceRecordCAA{DNSResourceRecord: base(packet.DNSTypeCAA)},
+		&packet.DNSResourceRecordDS{DNSResourceRecord: base(packet.DNSTypeDS)},
+		&packet.DNSResourceRecordDNSKEY{DNSResourceRecord: base(packet.DNSTypeDNSKEY)},
+		&packet.DNSResourceRecordRRSIG{DNSResourceRecord: base(packet.DNSTypeRRSIG)},
+		&packet.DNSResourceRecordNSEC{DNSResourceRecord: base(packet.DNSTypeNSEC)},
+		&packet.DNSResourceRecordTLSA{DNSResourceRecord: base(packet.DNSTypeTLSA)},
+		&packet.DNSResourceRecordSVCB{DNSResourceRecord: base(packet.DNSTypeHTTPS)},
+	}
+	for _, record := range records {
+		if got := recordTTL(record); got != 100 {
+			t.Fatalf("type %d TTL=%d, want 100", record.GetType(), got)
+		}
+		ageRecordTTL(record, 40)
+		if got := recordTTL(record); got != 60 {
+			t.Fatalf("type %d aged TTL=%d, want 60", record.GetType(), got)
+		}
 	}
 }

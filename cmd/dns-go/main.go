@@ -22,7 +22,7 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	handler, err := pipeline.New(cfg)
+	handler, err := buildService(cfg)
 	if err != nil {
 		log.Fatalf("pipeline: %v", err)
 	}
@@ -45,6 +45,24 @@ func main() {
 		log.Fatalf("listener error: %v", err)
 	case sig := <-sigCh:
 		log.Printf("received %v, shutting down", sig)
+	}
+}
+
+type dnsService interface {
+	server.DNSHandler
+	Close() error
+}
+
+func buildService(cfg *config.Config) (dnsService, error) {
+	switch cfg.Mode {
+	case "authoritative":
+		return pipeline.NewAuthoritativeFromConfig(cfg)
+	case "forwarding":
+		return pipeline.NewForwardingFromConfig(cfg)
+	case "hybrid":
+		return pipeline.New(cfg)
+	default:
+		return nil, fmt.Errorf("unknown mode: %s", cfg.Mode)
 	}
 }
 

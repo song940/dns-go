@@ -13,8 +13,9 @@ type DNSResourceRecordPTR struct {
 }
 
 // Decode implements DNSResource.
-func (r *DNSResourceRecordPTR) Decode(reader *bytes.Reader, length uint16) {
-	r.PtrDomainName, _ = decodeDomainName(reader)
+func (r *DNSResourceRecordPTR) Decode(reader *bytes.Reader, length uint16) (err error) {
+	r.PtrDomainName, err = decodeDomainName(reader)
+	return err
 }
 
 // Encode implements DNSResource.

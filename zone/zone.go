@@ -1,11 +1,18 @@
 package zone
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"math"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/lsongdev/dns-go/packet"
 )
@@ -138,7 +145,6 @@ func parseLines(z *Zone, lines []lineToken) error {
 	return nil
 }
 
-
 func splitFields(s string) []string {
 	var fields []string
 	current := ""
@@ -173,7 +179,7 @@ func splitFields(s string) []string {
 
 func parseRecordLine(fields []string, z *Zone, defaultTTL uint32, lineno int) (packet.DNSResource, uint32, error) {
 	if len(fields) < 2 {
-		return nil, 0, nil
+		return nil, 0, fmt.Errorf("line %d: incomplete record", lineno)
 	}
 
 	idx := 0
@@ -184,13 +190,19 @@ func parseRecordLine(fields []string, z *Zone, defaultTTL uint32, lineno int) (p
 	ttl := defaultTTL
 	class := packet.DNSClassIN
 
-	if t, err := parseTTL(fields[idx]); err == nil {
-		ttl = t
-		idx++
+	if idx < len(fields) {
+		if t, err := parseTTL(fields[idx]); err == nil {
+			ttl = t
+			idx++
+		}
 	}
 
-	if fields[idx] == "IN" || fields[idx] == "CH" || fields[idx] == "CS" || fields[idx] == "HS" {
-		class = classFromString(fields[idx])
+	if idx >= len(fields) {
+		return nil, 0, fmt.Errorf("line %d: missing record type", lineno)
+	}
+	classToken := strings.ToUpper(fields[idx])
+	if classToken == "IN" || classToken == "CH" || classToken == "CS" || classToken == "HS" {
+		class = classFromString(classToken)
 		idx++
 	}
 
@@ -249,6 +261,22 @@ func buildRecord(name, rtype string, class packet.DNSClass, ttl uint32, rdata []
 		return buildSOA(name, class, ttl, rdata, lineno)
 	case "SRV":
 		return buildSRV(name, class, ttl, rdata, lineno)
+	case "CAA":
+		return buildCAA(name, class, ttl, rdata, lineno)
+	case "DS":
+		return buildDS(name, class, ttl, rdata, lineno)
+	case "DNSKEY":
+		return buildDNSKEY(name, class, ttl, rdata, lineno)
+	case "RRSIG":
+		return buildRRSIG(name, class, ttl, rdata, lineno)
+	case "NSEC":
+		return buildNSEC(name, class, ttl, rdata, lineno)
+	case "TLSA":
+		return buildTLSA(name, class, ttl, rdata, lineno)
+	case "SVCB":
+		return buildSVCB(name, class, ttl, rdata, lineno, packet.DNSTypeSVCB)
+	case "HTTPS":
+		return buildSVCB(name, class, ttl, rdata, lineno, packet.DNSTypeHTTPS)
 	default:
 		return nil, fmt.Errorf("line %d: unsupported record type %q", lineno, rtype)
 	}
@@ -292,11 +320,14 @@ func parseTTL(s string) (uint32, error) {
 		multiplier = 60
 		s = s[:len(s)-1]
 	}
-	v, err := strconv.ParseUint(s, 10, 32)
+	v, err := strconv.ParseUint(s, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("bad TTL value %q: %v", s, err)
 	}
-	return uint32(v) * multiplier, nil
+	if v > math.MaxUint32/uint64(multiplier) {
+		return 0, fmt.Errorf("TTL value %q overflows uint32", s)
+	}
+	return uint32(v * uint64(multiplier)), nil
 }
 
 func buildA(name string, class packet.DNSClass, ttl uint32, rdata []string, lineno int) (packet.DNSResource, error) {
@@ -323,7 +354,7 @@ func buildAAAA(name string, class packet.DNSClass, ttl uint32, rdata []string, l
 		return nil, fmt.Errorf("line %d: AAAA record requires an IPv6 address", lineno)
 	}
 	ip := net.ParseIP(rdata[0])
-	if ip == nil || ip.To16() == nil {
+	if ip == nil || ip.To16() == nil || ip.To4() != nil {
 		return nil, fmt.Errorf("line %d: invalid AAAA record IP %q", lineno, rdata[0])
 	}
 	return &packet.DNSResourceRecordAAAA{
@@ -490,4 +521,356 @@ func buildSRV(name string, class packet.DNSClass, ttl uint32, rdata []string, li
 		Port:     uint16(port),
 		Target:   rdata[3],
 	}, nil
+}
+
+func buildCAA(name string, class packet.DNSClass, ttl uint32, rdata []string, lineno int) (packet.DNSResource, error) {
+	if len(rdata) < 3 {
+		return nil, fmt.Errorf("line %d: CAA requires flags tag value", lineno)
+	}
+	flags, err := strconv.ParseUint(rdata[0], 10, 8)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid CAA flags: %v", lineno, err)
+	}
+	tag := trimQuotes(rdata[1])
+	if tag == "" || len(tag) > 255 {
+		return nil, fmt.Errorf("line %d: invalid CAA tag", lineno)
+	}
+	for _, ch := range tag {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+			return nil, fmt.Errorf("line %d: invalid CAA tag", lineno)
+		}
+	}
+	return &packet.DNSResourceRecordCAA{
+		DNSResourceRecord: packet.DNSResourceRecord{Name: name, Type: packet.DNSTypeCAA, Class: class, TTL: ttl},
+		Flags:             uint8(flags), Tag: tag, Value: trimQuotes(strings.Join(rdata[2:], " ")),
+	}, nil
+}
+
+func buildDS(name string, class packet.DNSClass, ttl uint32, rdata []string, lineno int) (packet.DNSResource, error) {
+	if len(rdata) < 4 {
+		return nil, fmt.Errorf("line %d: DS requires key-tag algorithm digest-type digest", lineno)
+	}
+	keyTag, err := strconv.ParseUint(rdata[0], 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid DS key tag: %v", lineno, err)
+	}
+	algorithm, err := strconv.ParseUint(rdata[1], 10, 8)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid DS algorithm: %v", lineno, err)
+	}
+	digestType, err := strconv.ParseUint(rdata[2], 10, 8)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid DS digest type: %v", lineno, err)
+	}
+	digest, err := hex.DecodeString(strings.Join(rdata[3:], ""))
+	if err != nil || len(digest) == 0 {
+		return nil, fmt.Errorf("line %d: invalid DS digest", lineno)
+	}
+	return &packet.DNSResourceRecordDS{
+		DNSResourceRecord: packet.DNSResourceRecord{Name: name, Type: packet.DNSTypeDS, Class: class, TTL: ttl},
+		KeyTag:            uint16(keyTag), Algorithm: uint8(algorithm), DigestType: uint8(digestType), Digest: digest,
+	}, nil
+}
+
+func buildDNSKEY(name string, class packet.DNSClass, ttl uint32, rdata []string, lineno int) (packet.DNSResource, error) {
+	if len(rdata) < 4 {
+		return nil, fmt.Errorf("line %d: DNSKEY requires flags protocol algorithm public-key", lineno)
+	}
+	flags, err := strconv.ParseUint(rdata[0], 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid DNSKEY flags: %v", lineno, err)
+	}
+	protocol, err := strconv.ParseUint(rdata[1], 10, 8)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid DNSKEY protocol: %v", lineno, err)
+	}
+	algorithm, err := strconv.ParseUint(rdata[2], 10, 8)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid DNSKEY algorithm: %v", lineno, err)
+	}
+	publicKey, err := base64.StdEncoding.DecodeString(strings.Join(rdata[3:], ""))
+	if err != nil || len(publicKey) == 0 {
+		return nil, fmt.Errorf("line %d: invalid DNSKEY public key", lineno)
+	}
+	return &packet.DNSResourceRecordDNSKEY{
+		DNSResourceRecord: packet.DNSResourceRecord{Name: name, Type: packet.DNSTypeDNSKEY, Class: class, TTL: ttl},
+		Flags:             uint16(flags), Protocol: uint8(protocol), Algorithm: uint8(algorithm), PublicKey: publicKey,
+	}, nil
+}
+
+func buildRRSIG(name string, class packet.DNSClass, ttl uint32, rdata []string, lineno int) (packet.DNSResource, error) {
+	if len(rdata) < 9 {
+		return nil, fmt.Errorf("line %d: RRSIG requires type algorithm labels original-ttl expiration inception key-tag signer signature", lineno)
+	}
+	typeCovered, err := dnsTypeFromString(rdata[0])
+	if err != nil {
+		return nil, fmt.Errorf("line %d: %v", lineno, err)
+	}
+	algorithm, err := strconv.ParseUint(rdata[1], 10, 8)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid RRSIG algorithm", lineno)
+	}
+	labels, err := strconv.ParseUint(rdata[2], 10, 8)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid RRSIG labels", lineno)
+	}
+	originalTTL, err := parseTTL(rdata[3])
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid RRSIG original TTL: %v", lineno, err)
+	}
+	expiration, err := parseSignatureTime(rdata[4])
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid RRSIG expiration: %v", lineno, err)
+	}
+	inception, err := parseSignatureTime(rdata[5])
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid RRSIG inception: %v", lineno, err)
+	}
+	keyTag, err := strconv.ParseUint(rdata[6], 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid RRSIG key tag", lineno)
+	}
+	signature, err := base64.StdEncoding.DecodeString(strings.Join(rdata[8:], ""))
+	if err != nil || len(signature) == 0 {
+		return nil, fmt.Errorf("line %d: invalid RRSIG signature", lineno)
+	}
+	return &packet.DNSResourceRecordRRSIG{
+		DNSResourceRecord: packet.DNSResourceRecord{Name: name, Type: packet.DNSTypeRRSIG, Class: class, TTL: ttl},
+		TypeCovered:       typeCovered, Algorithm: uint8(algorithm), Labels: uint8(labels), OriginalTTL: originalTTL,
+		Expiration: expiration, Inception: inception, KeyTag: uint16(keyTag), SignerName: rdata[7], Signature: signature,
+	}, nil
+}
+
+func buildNSEC(name string, class packet.DNSClass, ttl uint32, rdata []string, lineno int) (packet.DNSResource, error) {
+	if len(rdata) < 2 {
+		return nil, fmt.Errorf("line %d: NSEC requires next-domain and at least one type", lineno)
+	}
+	types := make([]packet.DNSType, 0, len(rdata)-1)
+	for _, value := range rdata[1:] {
+		rtype, err := dnsTypeFromString(value)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %v", lineno, err)
+		}
+		types = append(types, rtype)
+	}
+	return &packet.DNSResourceRecordNSEC{
+		DNSResourceRecord: packet.DNSResourceRecord{Name: name, Type: packet.DNSTypeNSEC, Class: class, TTL: ttl},
+		NextDomain:        rdata[0], Types: types,
+	}, nil
+}
+
+func buildTLSA(name string, class packet.DNSClass, ttl uint32, rdata []string, lineno int) (packet.DNSResource, error) {
+	if len(rdata) < 4 {
+		return nil, fmt.Errorf("line %d: TLSA requires usage selector matching-type data", lineno)
+	}
+	usage, err := strconv.ParseUint(rdata[0], 10, 8)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid TLSA usage", lineno)
+	}
+	selector, err := strconv.ParseUint(rdata[1], 10, 8)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid TLSA selector", lineno)
+	}
+	matchingType, err := strconv.ParseUint(rdata[2], 10, 8)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid TLSA matching type", lineno)
+	}
+	data, err := hex.DecodeString(strings.Join(rdata[3:], ""))
+	if err != nil || len(data) == 0 {
+		return nil, fmt.Errorf("line %d: invalid TLSA certificate association data", lineno)
+	}
+	return &packet.DNSResourceRecordTLSA{
+		DNSResourceRecord:          packet.DNSResourceRecord{Name: name, Type: packet.DNSTypeTLSA, Class: class, TTL: ttl},
+		Usage:                      uint8(usage),
+		Selector:                   uint8(selector),
+		MatchingType:               uint8(matchingType),
+		CertificateAssociationData: data,
+	}, nil
+}
+
+func buildSVCB(name string, class packet.DNSClass, ttl uint32, rdata []string, lineno int, rtype packet.DNSType) (packet.DNSResource, error) {
+	if len(rdata) < 2 {
+		return nil, fmt.Errorf("line %d: SVCB/HTTPS requires priority and target", lineno)
+	}
+	priority, err := strconv.ParseUint(rdata[0], 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid SVCB priority", lineno)
+	}
+	params := make([]packet.SVCBParam, 0, len(rdata)-2)
+	seen := make(map[uint16]bool)
+	for _, field := range rdata[2:] {
+		param, err := parseSVCBParam(field)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %v", lineno, err)
+		}
+		if seen[param.Key] {
+			return nil, fmt.Errorf("line %d: duplicate SVCB parameter key %d", lineno, param.Key)
+		}
+		seen[param.Key] = true
+		params = append(params, param)
+	}
+	if priority == 0 && len(params) > 0 {
+		return nil, fmt.Errorf("line %d: SVCB alias mode cannot contain parameters", lineno)
+	}
+	if seen[packet.SVCBParamKeyNoDefaultALPN] && !seen[packet.SVCBParamKeyALPN] {
+		return nil, fmt.Errorf("line %d: no-default-alpn requires alpn", lineno)
+	}
+	for _, param := range params {
+		if param.Key != packet.SVCBParamKeyMandatory {
+			continue
+		}
+		for offset := 0; offset < len(param.Value); offset += 2 {
+			required := binary.BigEndian.Uint16(param.Value[offset : offset+2])
+			if !seen[required] {
+				return nil, fmt.Errorf("line %d: mandatory SVCB key %d is absent", lineno, required)
+			}
+		}
+	}
+	sort.Slice(params, func(i, j int) bool { return params[i].Key < params[j].Key })
+	return &packet.DNSResourceRecordSVCB{
+		DNSResourceRecord: packet.DNSResourceRecord{Name: name, Type: rtype, Class: class, TTL: ttl},
+		Priority:          uint16(priority), Target: rdata[1], Params: params,
+	}, nil
+}
+
+func parseSVCBParam(field string) (packet.SVCBParam, error) {
+	name, value, hasValue := strings.Cut(field, "=")
+	key, err := svcbKey(name)
+	if err != nil {
+		return packet.SVCBParam{}, err
+	}
+	value = trimQuotes(value)
+	var data []byte
+	switch key {
+	case packet.SVCBParamKeyMandatory:
+		if !hasValue || value == "" {
+			return packet.SVCBParam{}, fmt.Errorf("mandatory requires a value")
+		}
+		mandatoryKeys := make([]uint16, 0)
+		mandatorySeen := make(map[uint16]bool)
+		for _, item := range strings.Split(value, ",") {
+			mandatoryKey, err := svcbKey(item)
+			if err != nil || mandatoryKey == 0 || mandatorySeen[mandatoryKey] {
+				return packet.SVCBParam{}, fmt.Errorf("invalid mandatory key %q", item)
+			}
+			mandatorySeen[mandatoryKey] = true
+			mandatoryKeys = append(mandatoryKeys, mandatoryKey)
+		}
+		sort.Slice(mandatoryKeys, func(i, j int) bool { return mandatoryKeys[i] < mandatoryKeys[j] })
+		var buf bytes.Buffer
+		for _, mandatoryKey := range mandatoryKeys {
+			_ = binary.Write(&buf, binary.BigEndian, mandatoryKey)
+		}
+		data = buf.Bytes()
+	case packet.SVCBParamKeyALPN:
+		if !hasValue || value == "" {
+			return packet.SVCBParam{}, fmt.Errorf("alpn requires a value")
+		}
+		var buf bytes.Buffer
+		for _, alpn := range strings.Split(value, ",") {
+			if alpn == "" || len(alpn) > 255 {
+				return packet.SVCBParam{}, fmt.Errorf("invalid alpn value")
+			}
+			buf.WriteByte(byte(len(alpn)))
+			buf.WriteString(alpn)
+		}
+		data = buf.Bytes()
+	case packet.SVCBParamKeyNoDefaultALPN:
+		if hasValue && value != "" {
+			return packet.SVCBParam{}, fmt.Errorf("no-default-alpn must be empty")
+		}
+	case packet.SVCBParamKeyPort:
+		port, err := strconv.ParseUint(value, 10, 16)
+		if err != nil {
+			return packet.SVCBParam{}, fmt.Errorf("invalid SVCB port")
+		}
+		data = make([]byte, 2)
+		binary.BigEndian.PutUint16(data, uint16(port))
+	case packet.SVCBParamKeyIPv4Hint, packet.SVCBParamKeyIPv6Hint:
+		for _, rawIP := range strings.Split(value, ",") {
+			ip := net.ParseIP(rawIP)
+			if key == packet.SVCBParamKeyIPv4Hint {
+				ip = ip.To4()
+			} else if ip != nil && ip.To4() == nil {
+				ip = ip.To16()
+			} else {
+				ip = nil
+			}
+			if ip == nil {
+				return packet.SVCBParam{}, fmt.Errorf("invalid IP hint %q", rawIP)
+			}
+			data = append(data, ip...)
+		}
+	case packet.SVCBParamKeyECH:
+		decoded, err := base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			return packet.SVCBParam{}, fmt.Errorf("invalid ech value")
+		}
+		data = decoded
+	default:
+		data = []byte(value)
+	}
+	return packet.SVCBParam{Key: key, Value: data}, nil
+}
+
+func svcbKey(name string) (uint16, error) {
+	known := map[string]uint16{
+		"mandatory": packet.SVCBParamKeyMandatory, "alpn": packet.SVCBParamKeyALPN,
+		"no-default-alpn": packet.SVCBParamKeyNoDefaultALPN, "port": packet.SVCBParamKeyPort,
+		"ipv4hint": packet.SVCBParamKeyIPv4Hint, "ech": packet.SVCBParamKeyECH,
+		"ipv6hint": packet.SVCBParamKeyIPv6Hint, "dohpath": packet.SVCBParamKeyDoHPath,
+	}
+	if key, ok := known[strings.ToLower(name)]; ok {
+		return key, nil
+	}
+	if strings.HasPrefix(strings.ToLower(name), "key") {
+		value, err := strconv.ParseUint(name[3:], 10, 16)
+		return uint16(value), err
+	}
+	return 0, fmt.Errorf("unknown SVCB parameter %q", name)
+}
+
+func dnsTypeFromString(value string) (packet.DNSType, error) {
+	types := map[string]packet.DNSType{
+		"A": packet.DNSTypeA, "NS": packet.DNSTypeNS, "CNAME": packet.DNSTypeCNAME,
+		"SOA": packet.DNSTypeSOA, "PTR": packet.DNSTypePTR, "MX": packet.DNSTypeMX,
+		"TXT": packet.DNSTypeTXT, "AAAA": packet.DNSTypeAAAA, "SRV": packet.DNSTypeSRV,
+		"DS": packet.DNSTypeDS, "RRSIG": packet.DNSTypeRRSIG, "NSEC": packet.DNSTypeNSEC,
+		"DNSKEY": packet.DNSTypeDNSKEY, "TLSA": packet.DNSTypeTLSA, "SVCB": packet.DNSTypeSVCB,
+		"HTTPS": packet.DNSTypeHTTPS, "CAA": packet.DNSTypeCAA,
+	}
+	upper := strings.ToUpper(value)
+	if rtype, ok := types[upper]; ok {
+		return rtype, nil
+	}
+	if strings.HasPrefix(upper, "TYPE") {
+		numeric, err := strconv.ParseUint(upper[4:], 10, 16)
+		if err == nil {
+			return packet.DNSType(numeric), nil
+		}
+	}
+	return 0, fmt.Errorf("unknown DNS type %q", value)
+}
+
+func parseSignatureTime(value string) (uint32, error) {
+	if len(value) == 14 {
+		parsed, err := time.Parse("20060102150405", value)
+		if err != nil {
+			return 0, err
+		}
+		unix := parsed.Unix()
+		if unix < 0 || unix > math.MaxUint32 {
+			return 0, fmt.Errorf("signature time out of range")
+		}
+		return uint32(unix), nil
+	}
+	numeric, err := strconv.ParseUint(value, 10, 32)
+	return uint32(numeric), err
+}
+
+func trimQuotes(value string) string {
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+		return value[1 : len(value)-1]
+	}
+	return value
 }

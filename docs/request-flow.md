@@ -1,12 +1,12 @@
 # 请求处理流程
 
-本文档描述一个 DNS 请求从进入服务到响应返回的完整链路，对应 `config.yaml` 中
-`listens` / `domains` / `proxy` / `filters` 等配置块的协作顺序。
+本文档描述兼容 `hybrid` 模式的完整链路。生产环境应使用独立的
+`authoritative` 或 `forwarding` 模式，参见 [DNS 引擎与运行模式](./engines.md)。
 
 ## 设计原则
 
-1. **热路径最短**：缓存放在最前，命中即返回，跳过后续所有处理；
-2. **本地权威优先**：本地配置（`domains`、`zone_file`）的优先级高于过滤和上游；
+1. **权威边界优先**：先判断本地 zone，防止区内负答案访问缓存或泄漏到上游；
+2. **递归热路径最短**：区外查询优先访问缓存；
 3. **失败前置过滤**：过滤逻辑放在代理前面，命中黑名单的请求不应消耗上游配额；
 4. **白名单先于黑名单**：`@@` 例外规则优先于 `||` 黑名单，符合 AdBlock 语义。
 
@@ -27,15 +27,14 @@
                      │
                      ▼
         ┌─────────────────────────┐         命中
-        │ [2] Cache 查询           │──────────────┐
-        │   key = (qname, qtype)   │              │
+        │ [2] Local Authority       │──────────────┐
+        │   RRSet / negative/referral│             │
         └────────────┬────────────┘              │
                      │ 未命中                     │
                      ▼                            │
         ┌─────────────────────────┐         命中  │
-        │ [3] Local Domains        │──────────────┤
-        │   - 内联 records         │              │
-        │   - zone_file            │              │
+        │ [3] Recursive Cache       │──────────────┤
+        │   key = namespace/name/type/class        │
         └────────────┬────────────┘              │
                      │ 未命中                     │
                      ▼                            │
@@ -84,23 +83,15 @@
 `config.yaml` 中的 `listens` 数组每一项启动一个独立的 listener，共享同一个
 handler（也就是同一条 pipeline）。
 
-### [2] Cache 查询
+### [2] Local Authority
 
-最热的路径，直接返回。
-- **Key**：`(qname, qtype, qclass)`，建议小写化 qname；
-- **TTL**：使用响应中各 RR 的 TTL 最小值，并受 `cache.min_ttl` / `cache.max_ttl`
-  约束；
-- **命中后**：直接构造响应，跳过 [3]–[6]，进入 [7]；
-- **不缓存的项**：本地 records 命中的结果（已经是 O(1) 内存查找）、被 filter 阻断
-  的合成响应（避免规则热更新后残留旧判定）。
+先使用不可变 zone snapshot 判断最长匹配 zone。区内查询无论正答案、NODATA、
+NXDOMAIN 还是 referral 都在这里终止，不进入递归缓存、过滤器或 upstream。
 
-### [3] Local Domains
+### [3] Recursive Cache
 
-匹配 `domains[].domain` 中配置的任一 zone：
-- 命中 zone 后在内存索引里查找具体的 record；
-- 若 `zone_file` 指定，启动时解析并缓存到内存（`zone.ParseFile`）；
-- 命中即构造响应，**不进入 filter**——本地权威记录视为可信，不应被黑名单
-  误伤。
+仅处理区外转发查询。Key 支持 namespace、qname、qtype、qclass；命中时递减 RR
+TTL。缓存采用有界 LRU，只有 upstream 响应会写入。
 
 ### [4] Filter 过滤
 
@@ -145,16 +136,17 @@ handler（也就是同一条 pipeline）。
 ## 与 `config.yaml` 的对应关系
 
 ```yaml
+mode:           # authoritative | forwarding | hybrid
 listens:        # 阶段 [1]
-domains:        # 阶段 [3]
+domains:        # 阶段 [2]
 filters:        # 阶段 [4]
 proxy:          # 阶段 [5]
-cache:          # 阶段 [2] 和 [6]（建议补充该配置块）
+cache:          # 阶段 [3] 和 [6]
 ```
 
 ## 关键决策点
 
-- **缓存优先级最高**：拒绝在 cache 之前做任何昂贵操作，包括 filter trie 匹配；
+- **权威判断优先级最高**：防止热更新后的旧递归缓存覆盖权威数据；
 - **本地 records 不走 filter**：避免用户配的本地解析被远端规则集误伤；
 - **filter 在 proxy 之前**：阻断的请求不消耗上游配额、不暴露给上游；
 - **EDNS 透传需要兼容老客户端**：响应里的 OPT 在客户端未声明 EDNS 时必须剥离。

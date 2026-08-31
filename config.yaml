@@ -1,4 +1,6 @@
 
+mode: hybrid # production deployments should use authoritative or forwarding
+
 listens:
   - type: doh
     addr: ":8443"

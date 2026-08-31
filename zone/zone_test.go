@@ -356,3 +356,82 @@ func TestParseFileNotExist(t *testing.T) {
 		t.Fatal("expected error for nonexistent file")
 	}
 }
+
+func TestParseRejectsIncompleteRecordWithoutPanicking(t *testing.T) {
+	inputs := []string{
+		"example.com. 3600\n",
+		"example.com. IN\n",
+		"example.com.\n",
+	}
+	for _, input := range inputs {
+		if _, err := Parse([]byte(input)); err == nil {
+			t.Errorf("expected error for incomplete record %q", input)
+		}
+	}
+}
+
+func TestParseRejectsTTLOverflow(t *testing.T) {
+	if _, err := Parse([]byte("example.com. 4294967295W IN A 192.0.2.1\n")); err == nil {
+		t.Fatal("expected overflowing TTL to be rejected")
+	}
+}
+
+func TestParseRejectsIPv4InAAAA(t *testing.T) {
+	if _, err := Parse([]byte("example.com. IN AAAA 192.0.2.1\n")); err == nil {
+		t.Fatal("expected IPv4 address in AAAA record to be rejected")
+	}
+}
+
+func TestParseModernResourceRecords(t *testing.T) {
+	data := []byte("example.com. 300 IN CAA 0 issue \"letsencrypt.org\"\n" +
+		"child.example.com. 300 IN DS 12345 13 2 AABBCCDD\n" +
+		"example.com. 300 IN DNSKEY 257 3 13 AQIDBA==\n" +
+		"example.com. 300 IN RRSIG A 13 2 300 2000000000 1900000000 12345 example.com. AQIDBA==\n" +
+		"example.com. 300 IN NSEC next.example.com. A RRSIG CAA\n" +
+		"_443._tcp.example.com. 300 IN TLSA 3 1 1 DEADBEEF\n" +
+		"example.com. 300 IN HTTPS 1 svc.example.com. mandatory=alpn,port alpn=\"h2,h3\" port=443 ipv4hint=192.0.2.1\n")
+	z, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(z.Records) != 7 {
+		t.Fatalf("got %d records, want 7", len(z.Records))
+	}
+	if caa := z.Records[0].(*packet.DNSResourceRecordCAA); caa.Tag != "issue" || caa.Value != "letsencrypt.org" {
+		t.Fatalf("unexpected CAA: %#v", caa)
+	}
+	if ds := z.Records[1].(*packet.DNSResourceRecordDS); ds.KeyTag != 12345 || len(ds.Digest) != 4 {
+		t.Fatalf("unexpected DS: %#v", ds)
+	}
+	if key := z.Records[2].(*packet.DNSResourceRecordDNSKEY); key.Flags != 257 || len(key.PublicKey) != 4 {
+		t.Fatalf("unexpected DNSKEY: %#v", key)
+	}
+	if sig := z.Records[3].(*packet.DNSResourceRecordRRSIG); sig.TypeCovered != packet.DNSTypeA || sig.KeyTag != 12345 {
+		t.Fatalf("unexpected RRSIG: %#v", sig)
+	}
+	if nsec := z.Records[4].(*packet.DNSResourceRecordNSEC); len(nsec.Types) != 3 || nsec.Types[2] != packet.DNSTypeCAA {
+		t.Fatalf("unexpected NSEC: %#v", nsec)
+	}
+	if tlsa := z.Records[5].(*packet.DNSResourceRecordTLSA); len(tlsa.CertificateAssociationData) != 4 {
+		t.Fatalf("unexpected TLSA: %#v", tlsa)
+	}
+	if https := z.Records[6].(*packet.DNSResourceRecordSVCB); https.Type != packet.DNSTypeHTTPS || len(https.Params) != 4 || https.Params[0].Key != 0 {
+		t.Fatalf("unexpected HTTPS: %#v", https)
+	}
+}
+
+func TestParseRejectsInvalidSVCBParameters(t *testing.T) {
+	inputs := []string{
+		"example.com. IN SVCB 0 alias.example.com. alpn=h2\n",
+		"example.com. IN HTTPS 1 . port=443 port=8443\n",
+		"example.com. IN HTTPS 1 . mandatory=alpn port=443\n",
+		"example.com. IN HTTPS 1 . mandatory=alpn,alpn alpn=h2\n",
+		"example.com. IN HTTPS 1 . no-default-alpn\n",
+		"example.com. IN CAA 0 issue-wild ca.example\n",
+	}
+	for _, input := range inputs {
+		if _, err := Parse([]byte(input)); err == nil {
+			t.Errorf("expected invalid SVCB record to fail: %s", input)
+		}
+	}
+}

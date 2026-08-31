@@ -26,6 +26,7 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 }
 
 type Config struct {
+	Mode    string       `yaml:"mode"`
 	Listens []ListenSpec `yaml:"listens"`
 	Cache   CacheSpec    `yaml:"cache"`
 	Domains []DomainSpec `yaml:"domains"`
@@ -101,6 +102,9 @@ func Parse(data []byte) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
+	if c.Mode == "" {
+		c.Mode = "hybrid"
+	}
 	if c.Cache.MinTTL == 0 {
 		c.Cache.MinTTL = Duration(60 * time.Second)
 	}
@@ -128,6 +132,11 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) Validate() error {
+	switch c.Mode {
+	case "hybrid", "authoritative", "forwarding":
+	default:
+		return fmt.Errorf("mode %q invalid (want hybrid, authoritative, or forwarding)", c.Mode)
+	}
 	if len(c.Listens) == 0 {
 		return fmt.Errorf("at least one listen required")
 	}
@@ -169,6 +178,17 @@ func (c *Config) Validate() error {
 		if l.URL == "" && l.File == "" {
 			return fmt.Errorf("filters.allowlists[%d]: url or file required", i)
 		}
+	}
+	if c.Mode == "authoritative" {
+		if len(c.Domains) == 0 {
+			return fmt.Errorf("authoritative mode requires at least one domain")
+		}
+		if c.Cache.Enabled || len(c.Proxy.Upstreams) > 0 || len(c.Filters.Rules) > 0 || len(c.Filters.Blocklists) > 0 || len(c.Filters.Allowlists) > 0 {
+			return fmt.Errorf("authoritative mode cannot configure recursive cache, proxy, or filters")
+		}
+	}
+	if c.Mode == "forwarding" && len(c.Domains) > 0 {
+		return fmt.Errorf("forwarding mode cannot configure authoritative domains")
 	}
 	return nil
 }

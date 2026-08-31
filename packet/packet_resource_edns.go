@@ -3,25 +3,27 @@ package packet
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"io"
 	"net"
 )
 
 // EDNS Option Codes
 const (
-	EDNSOptionLLQ        uint16 = 1
-	EDNSOptionUL         uint16 = 2
-	EDNSOptionNSID       uint16 = 3
-	EDNSOptionDAU        uint16 = 5
-	EDNSOptionDHU        uint16 = 6
-	EDNSOptionN3U        uint16 = 7
+	EDNSOptionLLQ          uint16 = 1
+	EDNSOptionUL           uint16 = 2
+	EDNSOptionNSID         uint16 = 3
+	EDNSOptionDAU          uint16 = 5
+	EDNSOptionDHU          uint16 = 6
+	EDNSOptionN3U          uint16 = 7
 	EDNSOptionClientSubnet uint16 = 8
-	EDNSOptionExpire     uint16 = 9
-	EDNSOptionCookie     uint16 = 10
+	EDNSOptionExpire       uint16 = 9
+	EDNSOptionCookie       uint16 = 10
 	EDNSOptionTCPKeepalive uint16 = 11
-	EDNSOptionPadding    uint16 = 12
-	EDNSOptionChain      uint16 = 13
-	EDNSOptionKeyTag     uint16 = 14
-	EDNSOptionDeviceID   uint16 = 26
+	EDNSOptionPadding      uint16 = 12
+	EDNSOptionChain        uint16 = 13
+	EDNSOptionKeyTag       uint16 = 14
+	EDNSOptionDeviceID     uint16 = 26
 )
 
 type DNSResourceRecordEDNS struct {
@@ -40,21 +42,37 @@ type EDNSOption struct {
 }
 
 // Decode implements DNSResource.
-func (d *DNSResourceRecordEDNS) Decode(reader *bytes.Reader, length uint16) {
+func (d *DNSResourceRecordEDNS) Decode(reader *bytes.Reader, length uint16) error {
 	d.UDPSize = uint16(d.Class)
 	d.ExtRCode = uint8(d.TTL >> 24)
 	d.Version = uint8((d.TTL >> 16) & 0xFF)
 	d.Flags = uint16(d.TTL & 0xFFFF)
 
-	for reader.Len() > 0 {
+	remaining := int(length)
+	for remaining > 0 {
+		if remaining < 4 {
+			return fmt.Errorf("EDNS option header truncated: %d bytes remain", remaining)
+		}
 		var option EDNSOption
-		binary.Read(reader, binary.BigEndian, &option.Code)
+		if err := binary.Read(reader, binary.BigEndian, &option.Code); err != nil {
+			return err
+		}
 		var optionLength uint16
-		binary.Read(reader, binary.BigEndian, &optionLength)
+		if err := binary.Read(reader, binary.BigEndian, &optionLength); err != nil {
+			return err
+		}
+		remaining -= 4
+		if int(optionLength) > remaining {
+			return fmt.Errorf("EDNS option length %d exceeds remaining RDATA %d", optionLength, remaining)
+		}
 		option.Data = make([]byte, optionLength)
-		reader.Read(option.Data)
+		if _, err := io.ReadFull(reader, option.Data); err != nil {
+			return err
+		}
+		remaining -= int(optionLength)
 		d.Options = append(d.Options, option)
 	}
+	return nil
 }
 
 // Encode implements DNSResource.

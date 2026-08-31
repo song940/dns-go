@@ -3,12 +3,23 @@ package pipeline
 import "github.com/lsongdev/dns-go/packet"
 
 const (
-	rcodeNoError  = 0
-	rcodeServFail = 2
-	rcodeNXDOMAIN = 3
+	rcodeNoError        = 0
+	rcodeFormatError    = 1
+	rcodeServFail       = 2
+	rcodeNXDOMAIN       = 3
+	rcodeNotImplemented = 4
+	rcodeRefused        = 5
 
 	syntheticTTL = 60
 )
+
+// SynthError creates an empty DNS error response while preserving the
+// request ID, opcode, recursion flag, and question section.
+func SynthError(req *packet.DNSPacket, rcode uint8) *packet.DNSPacket {
+	res := emptyResponse(req)
+	res.Header.RCode = rcode
+	return res
+}
 
 func cloneHeader(h *packet.DNSHeader) *packet.DNSHeader {
 	cp := *h
@@ -21,7 +32,7 @@ func cloneHeader(h *packet.DNSHeader) *packet.DNSHeader {
 func emptyResponse(req *packet.DNSPacket) *packet.DNSPacket {
 	h := cloneHeader(req.Header)
 	h.QR = packet.DNSResponse
-	h.RA = 1
+	h.RA = 0
 	h.AA = 0
 	return &packet.DNSPacket{Header: h, Questions: req.Questions}
 }
@@ -59,12 +70,14 @@ func SynthSERVFAIL(req *packet.DNSPacket) *packet.DNSPacket {
 	return res
 }
 
-// buildLocalResponse wraps zone records as an authoritative answer for the
-// caller's question.
-func buildLocalResponse(req *packet.DNSPacket, records []packet.DNSResource) *packet.DNSPacket {
+func buildLocalResultResponse(req *packet.DNSPacket, result LocalResult) *packet.DNSPacket {
 	res := emptyResponse(req)
-	res.Header.AA = 1
-	res.Header.RCode = rcodeNoError
-	res.Answers = append(res.Answers, records...)
+	if result.Authoritative {
+		res.Header.AA = 1
+	}
+	res.Header.RCode = result.RCode
+	res.Answers = append(res.Answers, result.Answers...)
+	res.Authorities = append(res.Authorities, result.Authorities...)
+	res.Additionals = append(res.Additionals, result.Additionals...)
 	return res
 }

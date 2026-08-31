@@ -23,9 +23,12 @@ type DNSResourceRecordMX struct {
 }
 
 // Decode implements DNSResource.
-func (r *DNSResourceRecordMX) Decode(reader *bytes.Reader, length uint16) {
-	binary.Read(reader, binary.BigEndian, &r.Preference)
-	r.Exchange, _ = decodeDomainName(reader)
+func (r *DNSResourceRecordMX) Decode(reader *bytes.Reader, length uint16) (err error) {
+	if err = binary.Read(reader, binary.BigEndian, &r.Preference); err != nil {
+		return err
+	}
+	r.Exchange, err = decodeDomainName(reader)
+	return err
 }
 
 // Encode implements DNSResource.

@@ -11,8 +11,9 @@ type DNSResourceRecordCNAME struct {
 }
 
 // Decode implements DNSResource.
-func (d *DNSResourceRecordCNAME) Decode(reader *bytes.Reader, length uint16) {
-	d.Domain, _ = decodeDomainName(reader)
+func (d *DNSResourceRecordCNAME) Decode(reader *bytes.Reader, length uint16) (err error) {
+	d.Domain, err = decodeDomainName(reader)
+	return err
 }
 
 // Encode implements DNSResource.

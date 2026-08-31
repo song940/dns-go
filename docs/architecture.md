@@ -31,7 +31,7 @@
 │  │  └──────────┘ └───────────┘ └──────────────────────────┘  │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
-│  Resource Records: A, AAAA, CNAME, NS, SOA, TXT, SRV, EDNS      │
+│  Resource Records: classic, DNSSEC, CAA, TLSA, SVCB/HTTPS, EDNS │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -96,6 +96,14 @@
 
 ## 核心组件
 
+### 0. Engine 层 (pipeline/)
+
+- `AuthoritativeEngine`：只服务权威 snapshot，区外返回 REFUSED，不提供递归；
+- `ForwardingEngine`：缓存、过滤和 upstream 转发，不加载权威 zone；
+- `LocalIndex`：反向标签 trie + owner/type RRSet 索引，支持原子 snapshot 替换。
+
+生产环境应分别部署两个 engine；`pipeline.New` 的 hybrid 行为仅用于兼容。
+
 ### 1. Packet 层 (packet/)
 
 **职责**: DNS 协议的编解码
@@ -116,7 +124,7 @@
 **职责**: DNS 查询客户端
 
 - `UDPClient`: 基于 UDP 的传统 DNS 查询
-- `DoHClient`: 基于 HTTPS 的 DNS over HTTPS 查询
+- `HTTPClient`: 基于 HTTPS 的 DNS over HTTPS GET/POST 查询
 
 **接口**:
 ```go
@@ -148,7 +156,7 @@ type DNSHandler interface {
 
 ```go
 client.NewUDPClient("8.8.8.8:53")
-client.NewDoHClient("https://cloudflare-dns.com/dns-query")
+client.NewHTTPClientPost("https://cloudflare-dns.com/dns-query")
 ```
 
 ### 2. 命令模式 (Command Pattern)
@@ -174,7 +182,7 @@ type DNSResource interface {
     Bytes() []byte
     GetType() DNSType
     Encode() []byte
-    Decode(reader *bytes.Reader, length uint16)
+    Decode(reader *bytes.Reader, length uint16) error
 }
 ```
 
@@ -207,13 +215,13 @@ type DNSResource interface {
 | 组件 | 线程安全 | 说明 |
 |------|---------|------|
 | `DNSPacket` | ❌ | 无内部锁，需外部同步 |
-| `UDPClient` | ⚠️ | 每次 Query 创建新连接 |
-| `DoHClient` | ✅ | 使用 http.Client (线程安全) |
-| `ListenUDP` | ⚠️ | 单 goroutine 顺序处理 |
+| `UDPClient` | ✅ | 复用连接并串行保护请求/响应匹配 |
+| `HTTPClient` | ✅ | 复用线程安全的 http.Client 与连接池 |
+| `ListenUDP` | ✅ | 单 goroutine 接收，每请求 goroutine 处理 |
 | `ListenHTTP` | ✅ | http.Server 并发处理 |
 
 ## 性能考虑
 
 1. **内存分配**: 每次编解码都创建新的 buffer，可能产生 GC 压力
-2. **连接管理**: UDP 客户端每次查询创建新连接，无连接池
-3. **并发处理**: UDP 服务器单 goroutine 处理，未充分利用多核
+2. **连接管理**: UDP/TCP 客户端为正确性串行化共享连接，高吞吐场景可增加连接池
+3. **并发处理**: UDP 服务端当前为每请求创建 goroutine，后续应增加有界并发

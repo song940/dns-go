@@ -32,6 +32,9 @@ proxy:
 	if cfg.Proxy.Strategy != "failover" {
 		t.Errorf("default Strategy not applied: got %q", cfg.Proxy.Strategy)
 	}
+	if cfg.Mode != "hybrid" {
+		t.Errorf("default Mode not applied: got %q", cfg.Mode)
+	}
 	if cfg.Proxy.Upstreams[0].Timeout.Duration() != 5*time.Second {
 		t.Errorf("default Timeout not applied: got %v", cfg.Proxy.Upstreams[0].Timeout.Duration())
 	}
@@ -109,6 +112,16 @@ func TestValidateErrors(t *testing.T) {
 		src     string
 		wantErr string
 	}{
+		{
+			name: "unknown mode",
+			src: `
+mode: recursive-magic
+listens:
+  - type: udp
+    addr: ":5353"
+`,
+			wantErr: "mode",
+		},
 		{
 			name:    "no listens",
 			src:     `proxy: {upstreams: [{type: udp, addr: "1.1.1.1:53"}]}`,
@@ -208,6 +221,47 @@ proxy:
 			}
 			if !strings.Contains(err.Error(), tc.wantErr) {
 				t.Errorf("error %q does not contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestModeIsolation(t *testing.T) {
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{
+			name: "authoritative requires domain",
+			src: `mode: authoritative
+listens: [{type: udp, addr: ":5353"}]
+`,
+			wantErr: "requires at least one domain",
+		},
+		{
+			name: "authoritative rejects upstream",
+			src: `mode: authoritative
+listens: [{type: udp, addr: ":5353"}]
+domains: [{domain: example.com}]
+proxy: {upstreams: [{type: udp, addr: "1.1.1.1:53"}]}
+`,
+			wantErr: "cannot configure recursive cache",
+		},
+		{
+			name: "forwarding rejects domains",
+			src: `mode: forwarding
+listens: [{type: udp, addr: ":5353"}]
+domains: [{domain: example.com}]
+`,
+			wantErr: "cannot configure authoritative domains",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.src))
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("got error %v, want containing %q", err, tt.wantErr)
 			}
 		})
 	}

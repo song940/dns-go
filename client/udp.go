@@ -1,7 +1,6 @@
 package client
 
 import (
-	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -25,26 +24,28 @@ func NewUDPClient(server string) *UDPClient {
 }
 
 func (client *UDPClient) Query(req *packet.DNSPacket) (res *packet.DNSPacket, err error) {
-	conn, err := client.getConn()
+	client.mu.Lock()
+	defer client.mu.Unlock()
+
+	conn, err := client.getConnLocked()
 	if err != nil {
 		return nil, err
 	}
 
-	// Set read deadline for timeout
-	if err := conn.SetReadDeadline(time.Now().Add(client.Timeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(client.Timeout)); err != nil {
 		return nil, err
 	}
 
 	_, err = conn.Write(req.Bytes())
 	if err != nil {
-		client.closeConn()
+		client.closeConnLocked()
 		return nil, err
 	}
 
-	buf := make([]byte, 512)
+	buf := make([]byte, maxDNSMessageSize)
 	n, err := conn.Read(buf)
 	if err != nil {
-		client.closeConn()
+		client.closeConnLocked()
 		return nil, err
 	}
 
@@ -52,28 +53,32 @@ func (client *UDPClient) Query(req *packet.DNSPacket) (res *packet.DNSPacket, er
 	if err != nil {
 		return nil, err
 	}
-
-	if res.Header.RCode != 0 {
-		return nil, fmt.Errorf("query failed: %v", res.Header.RCode)
+	if err := validateResponse(req, res); err != nil {
+		client.closeConnLocked()
+		return nil, err
 	}
-
+	if res.Header.TC == 1 {
+		tcp := NewTCPClient(client.Server)
+		tcp.Timeout = client.Timeout
+		defer tcp.Close()
+		return tcp.Query(req)
+	}
 	return res, nil
 }
 
 // Close closes the underlying UDP connection.
 func (client *UDPClient) Close() error {
-	return client.closeConn()
-}
-
-func (client *UDPClient) getConn() (net.Conn, error) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
+	return client.closeConnLocked()
+}
 
+func (client *UDPClient) getConnLocked() (net.Conn, error) {
 	if client.conn != nil {
 		return client.conn, nil
 	}
 
-	conn, err := net.Dial("udp", client.Server)
+	conn, err := net.DialTimeout("udp", client.Server, client.Timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -82,10 +87,7 @@ func (client *UDPClient) getConn() (net.Conn, error) {
 	return conn, nil
 }
 
-func (client *UDPClient) closeConn() error {
-	client.mu.Lock()
-	defer client.mu.Unlock()
-
+func (client *UDPClient) closeConnLocked() error {
 	if client.conn != nil {
 		err := client.conn.Close()
 		client.conn = nil

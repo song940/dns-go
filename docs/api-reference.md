@@ -120,7 +120,7 @@ type DNSResource interface {
     Bytes() []byte
     GetType() DNSType
     Encode() []byte
-    Decode(reader *bytes.Reader, length uint16)
+    Decode(reader *bytes.Reader, length uint16) error
 }
 ```
 
@@ -151,8 +151,17 @@ type DNSResourceRecord struct {
 | NS | `DNSResourceRecordNS` | 名称服务器记录 |
 | SOA | `DNSResourceRecordSOA` | 授权起始记录 |
 | TXT | `DNSResourceRecordTXT` | 文本记录 |
+| MX | `DNSResourceRecordMX` | 邮件交换记录 |
+| PTR | `DNSResourceRecordPTR` | 反向指针记录 |
 | SRV | `DNSResourceRecordSRV` | 服务定位记录 |
 | EDNS | `DNSResourceRecordEDNS` | 扩展 DNS 记录 |
+| CAA | `DNSResourceRecordCAA` | CA 授权记录 |
+| DS | `DNSResourceRecordDS` | DNSSEC 委派签名者记录 |
+| DNSKEY | `DNSResourceRecordDNSKEY` | DNSSEC 公钥记录 |
+| RRSIG | `DNSResourceRecordRRSIG` | DNSSEC 签名记录 |
+| NSEC | `DNSResourceRecordNSEC` | DNSSEC 不存在性证明记录 |
+| TLSA | `DNSResourceRecordTLSA` | TLS 证书关联记录 |
+| SVCB / HTTPS | `DNSResourceRecordSVCB` | 服务绑定记录；通过 `Type` 区分两种线类型 |
 
 **示例 - A 记录**:
 
@@ -187,7 +196,15 @@ const (
     DNSTypeAAAA  DNSType = 0x001C  // AAAA 记录
     DNSTypeSRV   DNSType = 0x0021  // SRV 记录
     DNSTypeEDNS  DNSType = 0x0029  // EDNS
+    DNSTypeDS     DNSType = 0x002B  // DS
+    DNSTypeRRSIG  DNSType = 0x002E  // RRSIG
+    DNSTypeNSEC   DNSType = 0x002F  // NSEC
+    DNSTypeDNSKEY DNSType = 0x0030  // DNSKEY
+    DNSTypeTLSA   DNSType = 0x0034  // TLSA
+    DNSTypeSVCB   DNSType = 0x0040  // SVCB
+    DNSTypeHTTPS  DNSType = 0x0041  // HTTPS
     DNSTypeAny   DNSType = 0x00FF  // 任意类型
+    DNSTypeCAA    DNSType = 0x0101  // CAA
 )
 ```
 
@@ -250,14 +267,15 @@ if err != nil {
 
 ---
 
-#### `DoHClient`
+#### `HTTPClient`
 
 基于 HTTPS 的 DNS over HTTPS 客户端。
 
 ```go
-type DoHClient struct {
+type HTTPClient struct {
     Server  string        // DoH 服务器 URL
     Timeout time.Duration // 请求超时
+    UsePost bool          // 是否使用 POST；否则使用 GET
 }
 ```
 
@@ -265,13 +283,15 @@ type DoHClient struct {
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `NewDoHClient` | `func NewDoHClient(server string) *DoHClient` | 创建 DoH 客户端 |
-| `Query` | `func (client *DoHClient) Query(query *packet.DNSPacket) (*packet.DNSPacket, error)` | 发送 DNS 查询 |
+| `NewHTTPClient` | `func NewHTTPClient(server string) *HTTPClient` | 创建使用 GET 的 DoH 客户端 |
+| `NewHTTPClientPost` | `func NewHTTPClientPost(server string) *HTTPClient` | 创建使用 POST 的 DoH 客户端 |
+| `Query` | `func (client *HTTPClient) Query(query *packet.DNSPacket) (*packet.DNSPacket, error)` | 发送 DNS 查询 |
+| `Close` | `func (client *HTTPClient) Close() error` | 关闭空闲 HTTP 连接 |
 
 **示例**:
 
 ```go
-c := client.NewDoHClient("https://cloudflare-dns.com/dns-query")
+c := client.NewHTTPClientPost("https://cloudflare-dns.com/dns-query")
 query := packet.NewPacket()
 query.AddQuestionA("google.com")
 res, err := c.Query(query)
@@ -364,10 +384,12 @@ if err != nil {
 
 #### `ListenHTTP`
 
-启动 HTTP/DoH DNS 服务器。
+启动 HTTP/DoH DNS 服务器，支持 RFC 8484 GET 和 POST。若需要挂载到已有
+`http.Server` 或路由器，可使用 `NewHTTPHandler`。
 
 ```go
 func ListenHTTP(addr string, handler DNSHandler) error
+func NewHTTPHandler(handler DNSHandler) http.Handler
 ```
 
 **参数**:
@@ -400,5 +422,8 @@ if err != nil {
 常见的错误情况:
 - 网络连接失败
 - 数据包解码失败
-- DNS 服务器返回错误响应码 (RCode != 0)
-- 请求超时 (DoH)
+- 响应 ID 或 Question 与请求不匹配
+- 请求超时
+
+`NXDOMAIN`、`REFUSED`、`SERVFAIL` 等 RCode 是有效 DNS 响应，`Query` 会将其
+返回给调用者，由调用者检查 `res.Header.RCode`，不会将其转换为网络错误。

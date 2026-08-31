@@ -70,22 +70,22 @@ func TestEncodeDecodeMXRecord(t *testing.T) {
 	// Test full packet encoding/decoding
 	pkt := NewPacket()
 	pkt.AddAnswer(mx)
-	
+
 	encoded := pkt.Bytes()
 	decoded, err := FromBytes(encoded)
 	if err != nil {
 		t.Fatalf("Failed to decode: %v", err)
 	}
-	
+
 	if len(decoded.Answers) != 1 {
 		t.Fatalf("Expected 1 answer, got %d", len(decoded.Answers))
 	}
-	
+
 	decodedMX, ok := decoded.Answers[0].(*DNSResourceRecordMX)
 	if !ok {
 		t.Fatalf("Expected MX record, got %T", decoded.Answers[0])
 	}
-	
+
 	if decodedMX.Preference != mx.Preference {
 		t.Errorf("Preference mismatch: expected %d, got %d", mx.Preference, decodedMX.Preference)
 	}
@@ -108,22 +108,22 @@ func TestEncodeDecodePTRRecord(t *testing.T) {
 	// Test full packet encoding/decoding
 	pkt := NewPacket()
 	pkt.AddAnswer(ptr)
-	
+
 	encoded := pkt.Bytes()
 	decoded, err := FromBytes(encoded)
 	if err != nil {
 		t.Fatalf("Failed to decode: %v", err)
 	}
-	
+
 	if len(decoded.Answers) != 1 {
 		t.Fatalf("Expected 1 answer, got %d", len(decoded.Answers))
 	}
-	
+
 	decodedPTR, ok := decoded.Answers[0].(*DNSResourceRecordPTR)
 	if !ok {
 		t.Fatalf("Expected PTR record, got %T", decoded.Answers[0])
 	}
-	
+
 	if decodedPTR.PtrDomainName != ptr.PtrDomainName {
 		t.Errorf("PtrDomainName mismatch: expected %s, got %s", ptr.PtrDomainName, decodedPTR.PtrDomainName)
 	}
@@ -143,22 +143,22 @@ func TestEncodeDecodeARecord(t *testing.T) {
 	// Test full packet encoding/decoding
 	pkt := NewPacket()
 	pkt.AddAnswer(a)
-	
+
 	encoded := pkt.Bytes()
 	decoded, err := FromBytes(encoded)
 	if err != nil {
 		t.Fatalf("Failed to decode: %v", err)
 	}
-	
+
 	if len(decoded.Answers) != 1 {
 		t.Fatalf("Expected 1 answer, got %d", len(decoded.Answers))
 	}
-	
+
 	decodedA, ok := decoded.Answers[0].(*DNSResourceRecordA)
 	if !ok {
 		t.Fatalf("Expected A record, got %T", decoded.Answers[0])
 	}
-	
+
 	if decodedA.Address != a.Address {
 		t.Errorf("Address mismatch: expected %s, got %s", a.Address, decodedA.Address)
 	}
@@ -178,22 +178,22 @@ func TestEncodeDecodeNSRecord(t *testing.T) {
 	// Test full packet encoding/decoding
 	pkt := NewPacket()
 	pkt.AddAnswer(ns)
-	
+
 	encoded := pkt.Bytes()
 	decoded, err := FromBytes(encoded)
 	if err != nil {
 		t.Fatalf("Failed to decode: %v", err)
 	}
-	
+
 	if len(decoded.Answers) != 1 {
 		t.Fatalf("Expected 1 answer, got %d", len(decoded.Answers))
 	}
-	
+
 	decodedNS, ok := decoded.Answers[0].(*DNSResourceRecordNS)
 	if !ok {
 		t.Fatalf("Expected NS record, got %T", decoded.Answers[0])
 	}
-	
+
 	if decodedNS.NameServer != ns.NameServer {
 		t.Errorf("NameServer mismatch: expected %s, got %s", ns.NameServer, decodedNS.NameServer)
 	}
@@ -309,5 +309,21 @@ func TestAddAdditionalEDNS(t *testing.T) {
 
 	if !edns.GetDNSSECOK() {
 		t.Error("Expected DNSSEC OK flag to be set")
+	}
+}
+
+func TestFromBytesRejectsCompressionPointerLoop(t *testing.T) {
+	header := (&DNSHeader{QDCount: 1}).Bytes()
+	data := append(header, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01)
+	if _, err := FromBytes(data); err == nil {
+		t.Fatal("expected self-referencing compression pointer to be rejected")
+	}
+}
+
+func TestFromBytesRejectsReservedLabelEncoding(t *testing.T) {
+	header := (&DNSHeader{QDCount: 1}).Bytes()
+	data := append(header, 0x40, 0x00, 0x01, 0x00, 0x01)
+	if _, err := FromBytes(data); err == nil {
+		t.Fatal("expected reserved label encoding to be rejected")
 	}
 }

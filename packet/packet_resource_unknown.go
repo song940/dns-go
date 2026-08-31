@@ -12,13 +12,11 @@ type DNSResourceRecordUnknown struct {
 	RData []byte
 }
 
-func (r *DNSResourceRecordUnknown) Decode(reader *bytes.Reader, length uint16) {
+func (r *DNSResourceRecordUnknown) Decode(reader *bytes.Reader, length uint16) error {
 	// Read RDATA bytes
 	r.RData = make([]byte, length)
 	_, err := io.ReadFull(reader, r.RData)
-	if err != nil {
-		// Ignore error - RDATA may be partially read
-	}
+	return err
 }
 
 func (r *DNSResourceRecordUnknown) Encode() []byte {

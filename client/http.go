@@ -7,8 +7,11 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
+	"net/url"
+	"sync"
 	"time"
 
 	"github.com/lsongdev/dns-go/packet"
@@ -21,6 +24,9 @@ type HTTPClient struct {
 	Server  string
 	Timeout time.Duration
 	UsePost bool // Use POST method instead of GET
+
+	once   sync.Once
+	client *http.Client
 }
 
 // NewHTTPClient creates a new DoH client.
@@ -67,7 +73,7 @@ func createHTTPClient(timeout time.Duration) *http.Client {
 // Query sends a DNS query and returns the response.
 func (c *HTTPClient) Query(query *packet.DNSPacket) (res *packet.DNSPacket, err error) {
 	queryData := query.Bytes()
-	httpClient := createHTTPClient(c.Timeout)
+	httpClient := c.getHTTPClient()
 
 	var req *http.Request
 	if c.UsePost {
@@ -80,8 +86,14 @@ func (c *HTTPClient) Query(query *packet.DNSPacket) (res *packet.DNSPacket, err 
 	} else {
 		// GET request
 		b64Req := base64.RawURLEncoding.EncodeToString(queryData)
-		url := fmt.Sprintf("%s?dns=%s", c.Server, b64Req)
-		req, err = http.NewRequest(http.MethodGet, url, nil)
+		u, parseErr := url.Parse(c.Server)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		params := u.Query()
+		params.Set("dns", b64Req)
+		u.RawQuery = params.Encode()
+		req, err = http.NewRequest(http.MethodGet, u.String(), nil)
 		if err != nil {
 			return nil, err
 		}
@@ -103,16 +115,36 @@ func (c *HTTPClient) Query(query *packet.DNSPacket) (res *packet.DNSPacket, err 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("DoH server returned status %d", resp.StatusCode)
 	}
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/dns-message" {
+		return nil, fmt.Errorf("DoH server returned content type %q", resp.Header.Get("Content-Type"))
+	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSMessageSize+1))
 	if err != nil {
 		return nil, err
 	}
-
-	return packet.FromBytes(body)
+	if len(body) > maxDNSMessageSize {
+		return nil, fmt.Errorf("DoH response is too large")
+	}
+	res, err = packet.FromBytes(body)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateResponse(query, res); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 func (c *HTTPClient) Close() error {
-	// HTTP client doesn't need closing
+	c.getHTTPClient().CloseIdleConnections()
 	return nil
+}
+
+func (c *HTTPClient) getHTTPClient() *http.Client {
+	c.once.Do(func() {
+		c.client = createHTTPClient(c.Timeout)
+	})
+	return c.client
 }

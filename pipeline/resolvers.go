@@ -37,12 +37,11 @@ func (r *LocalResolver) Query(req *packet.DNSPacket) (*packet.DNSPacket, error) 
 		return nil, nil
 	}
 	q := req.Questions[0]
-	qname := strings.ToLower(strings.TrimSuffix(q.Name, "."))
-	records := r.local.Lookup(qname, q.Type)
-	if len(records) == 0 {
+	result := r.local.Resolve(q.Name, q.Type)
+	if !result.InZone {
 		return nil, nil
 	}
-	return buildLocalResponse(req, records), nil
+	return buildLocalResultResponse(req, result), nil
 }
 
 // FilterResolver short-circuits matched names with a synthesized block answer

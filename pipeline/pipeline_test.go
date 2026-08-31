@@ -57,7 +57,11 @@ func newCache(t *testing.T) *cache.Cache {
 }
 
 func emptyLocal() *LocalIndex {
-	return &LocalIndex{zones: map[string][]packet.DNSResource{}}
+	local, err := NewLocalIndex(nil)
+	if err != nil {
+		panic(err)
+	}
+	return local
 }
 
 func dispatch(t *testing.T, h *Handler, req *packet.DNSPacket) *packet.DNSPacket {
@@ -149,6 +153,19 @@ func TestHandlerFilterBlock(t *testing.T) {
 	}
 }
 
+func TestHandlerFilterBlockIsNotCached(t *testing.T) {
+	flt := filter.New()
+	if err := flt.AddRule("||bad.com^"); err != nil {
+		t.Fatal(err)
+	}
+	cc := newCache(t)
+	h := newHandler(cc, emptyLocal(), flt, nil)
+	dispatch(t, h, makeRequest("bad.com", packet.DNSTypeA))
+	if got := cc.Len(); got != 0 {
+		t.Fatalf("filter result must not enter recursive cache, len=%d", got)
+	}
+}
+
 func TestHandlerFilterBlockAAAA(t *testing.T) {
 	flt := filter.New()
 	if err := flt.AddRule("||bad.com^"); err != nil {
@@ -182,6 +199,27 @@ func TestHandlerNoPoolReturnsServfail(t *testing.T) {
 	resp := dispatch(t, h, makeRequest("google.com", packet.DNSTypeA))
 	if resp.Header.RCode != 2 {
 		t.Errorf("expected SERVFAIL with no pool, got rcode=%d", resp.Header.RCode)
+	}
+}
+
+func TestHandlerRejectsMalformedQuestionCount(t *testing.T) {
+	h := newHandler(nil, emptyLocal(), filter.New(), nil)
+	req := &packet.DNSPacket{Header: &packet.DNSHeader{ID: 0x1234}}
+
+	resp := dispatch(t, h, req)
+	if resp.Header.RCode != rcodeFormatError {
+		t.Fatalf("got rcode %d, want FORMERR", resp.Header.RCode)
+	}
+}
+
+func TestHandlerRejectsUnsupportedOpcode(t *testing.T) {
+	h := newHandler(nil, emptyLocal(), filter.New(), nil)
+	req := makeRequest("example.com", packet.DNSTypeA)
+	req.Header.OpCode = uint8(packet.DNSOpCodeUpdate)
+
+	resp := dispatch(t, h, req)
+	if resp.Header.RCode != rcodeNotImplemented {
+		t.Fatalf("got rcode %d, want NOTIMP", resp.Header.RCode)
 	}
 }
 
@@ -254,11 +292,7 @@ func TestStripEDNSPaddingFromUpstream(t *testing.T) {
 	}
 }
 
-// TestHandlerLocalIsCached covers a B′ semantic: local hits are written back
-// to cache too (the dispatcher caches everything past chain[0]). Previously
-// local was explicitly excluded from cache; now caching is uniform and
-// driven by TTLs only.
-func TestHandlerLocalIsCached(t *testing.T) {
+func TestHandlerLocalIsNotCached(t *testing.T) {
 	local, err := NewLocalIndex([]config.DomainSpec{
 		{Domain: "example.com", Records: []string{"nas IN A 10.0.0.1"}},
 	})
@@ -269,8 +303,8 @@ func TestHandlerLocalIsCached(t *testing.T) {
 	h := newHandler(cc, local, filter.New(), nil)
 
 	dispatch(t, h, makeRequest("nas.example.com", packet.DNSTypeA))
-	if got := cc.Len(); got != 1 {
-		t.Errorf("local hit should be cached, len=%d", got)
+	if got := cc.Len(); got != 0 {
+		t.Errorf("local hit must not enter recursive cache, len=%d", got)
 	}
 }
 
@@ -304,6 +338,6 @@ func TestNewFromConfig(t *testing.T) {
 		t.Error("pool should be initialised when upstreams configured")
 	}
 	if len(h.chain) != 4 {
-		t.Errorf("expected chain [cache, local, filter, proxy], got len=%d", len(h.chain))
+		t.Errorf("expected chain [local, cache, filter, proxy], got len=%d", len(h.chain))
 	}
 }

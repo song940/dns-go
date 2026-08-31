@@ -34,12 +34,14 @@ type UpstreamPool interface {
 }
 
 // Handler implements server.DNSHandler with a uniform chain of Resolvers.
-// Cache is held separately so the dispatcher can write fresh answers back
-// (resolver chain[0] is the cache itself; everything past it gets cached).
+// Cache is held separately so the dispatcher can write upstream answers back.
+// Authoritative and policy-generated answers deliberately bypass it.
 type Handler struct {
-	chain []Resolver
-	cache *cache.Cache
-	pool  UpstreamPool // tracked so Close() can shut upstreams down
+	chain              []Resolver
+	cache              *cache.Cache
+	pool               UpstreamPool // tracked so Close() can shut upstreams down
+	recursionAvailable bool
+	fallbackRCode      uint8
 }
 
 func New(cfg *config.Config) (*Handler, error) {
@@ -79,11 +81,11 @@ func New(cfg *config.Config) (*Handler, error) {
 // the chain directly because UpstreamPool ⊇ Resolver.
 func newHandler(cc *cache.Cache, local LocalSource, flt *filter.Filter, pool UpstreamPool) *Handler {
 	chain := make([]Resolver, 0, 4)
-	if cc != nil {
-		chain = append(chain, &CacheResolver{cache: cc})
-	}
 	if local != nil {
 		chain = append(chain, &LocalResolver{local: local})
+	}
+	if cc != nil {
+		chain = append(chain, &CacheResolver{cache: cc})
 	}
 	if flt != nil {
 		chain = append(chain, &FilterResolver{filter: flt})
@@ -91,7 +93,13 @@ func newHandler(cc *cache.Cache, local LocalSource, flt *filter.Filter, pool Ups
 	if pool != nil {
 		chain = append(chain, pool)
 	}
-	return &Handler{chain: chain, cache: cc, pool: pool}
+	return &Handler{
+		chain:              chain,
+		cache:              cc,
+		pool:               pool,
+		recursionAvailable: pool != nil,
+		fallbackRCode:      rcodeServFail,
+	}
 }
 
 func (h *Handler) Close() error {
@@ -106,10 +114,23 @@ func (h *Handler) Close() error {
 // per-request) so this runs synchronously.
 func (h *Handler) HandleQuery(conn *server.PackConn) {
 	req := conn.Request
-	if req == nil || len(req.Questions) == 0 {
+	if req == nil || req.Header == nil || req.Header.QR != packet.DNSQuery {
 		return
 	}
-	resp := h.resolve(req)
+	var resp *packet.DNSPacket
+	switch {
+	case req.Header.OpCode != uint8(packet.DNSOpCodeQuery):
+		resp = SynthError(req, rcodeNotImplemented)
+	case len(req.Questions) != 1:
+		resp = SynthError(req, rcodeFormatError)
+	default:
+		resp = h.resolve(req)
+	}
+	if h.recursionAvailable {
+		resp.Header.RA = 1
+	} else {
+		resp.Header.RA = 0
+	}
 	StripEDNSIfNeeded(req, resp)
 	if err := conn.WriteResponse(resp); err != nil {
 		log.Printf("[%s] write error: %v", conn.RemoteAddr, err)
@@ -117,11 +138,8 @@ func (h *Handler) HandleQuery(conn *server.PackConn) {
 }
 
 // resolve walks the chain and returns the first claimed response (or a
-// synthesized SERVFAIL). The cache write-back lives here because it's a
-// cross-cutting concern, not a property of any single resolver — every
-// answer past chain[0] (the cache itself) is a candidate to cache.
-// Errors are logged and treated as pass-through; SERVFAIL synthesis only
-// happens at the end if nothing in the chain claimed the request.
+// configured fallback). The cache write-back lives here because it is a
+// cross-cutting concern. Errors are logged and treated as pass-through.
 func (h *Handler) resolve(req *packet.DNSPacket) *packet.DNSPacket {
 	for i, r := range h.chain {
 		resp, err := r.Query(req)
@@ -132,13 +150,22 @@ func (h *Handler) resolve(req *packet.DNSPacket) *packet.DNSPacket {
 		if resp == nil {
 			continue
 		}
-		if i > 0 && h.cache != nil {
+		if h.cache != nil && cacheableResolver(r) {
 			h.cache.Put(cache.KeyOf(req.Questions[0]), resp)
 		}
 		resp.Header.ID = req.Header.ID
 		return resp
 	}
-	return SynthSERVFAIL(req)
+	return SynthError(req, h.fallbackRCode)
+}
+
+func cacheableResolver(r Resolver) bool {
+	switch r.(type) {
+	case *LocalResolver, *CacheResolver, *FilterResolver:
+		return false
+	default:
+		return true
+	}
 }
 
 func buildFilter(spec config.FiltersSpec) (*filter.Filter, error) {

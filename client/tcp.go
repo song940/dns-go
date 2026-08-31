@@ -56,25 +56,29 @@ func NewTLSClientWithConfig(server string, tlsConfig *tls.Config) *TCPClient {
 
 // Query sends a DNS query and returns the response.
 func (c *TCPClient) Query(req *packet.DNSPacket) (res *packet.DNSPacket, err error) {
-	conn, err := c.getConn()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	conn, err := c.getConnLocked()
 	if err != nil {
 		return nil, err
 	}
 
-	// Set read deadline for timeout
-	if err := conn.SetReadDeadline(time.Now().Add(c.Timeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(c.Timeout)); err != nil {
 		return nil, err
 	}
 
 	// Encode the query with 2-byte length prefix
 	queryData := req.Bytes()
+	if len(queryData) > maxDNSMessageSize {
+		return nil, fmt.Errorf("DNS query is too large: %d bytes", len(queryData))
+	}
 	lengthBuf := make([]byte, 2)
 	binary.BigEndian.PutUint16(lengthBuf, uint16(len(queryData)))
 
 	// Write length prefix + query data
-	_, err = conn.Write(append(lengthBuf, queryData...))
-	if err != nil {
-		c.closeConn()
+	if err = writeFull(conn, append(lengthBuf, queryData...)); err != nil {
+		c.closeConnLocked()
 		return nil, err
 	}
 
@@ -82,7 +86,7 @@ func (c *TCPClient) Query(req *packet.DNSPacket) (res *packet.DNSPacket, err err
 	lengthBuf = make([]byte, 2)
 	_, err = io.ReadFull(conn, lengthBuf)
 	if err != nil {
-		c.closeConn()
+		c.closeConnLocked()
 		return nil, err
 	}
 	msgLen := binary.BigEndian.Uint16(lengthBuf)
@@ -91,7 +95,7 @@ func (c *TCPClient) Query(req *packet.DNSPacket) (res *packet.DNSPacket, err err
 	buf := make([]byte, msgLen)
 	_, err = io.ReadFull(conn, buf)
 	if err != nil {
-		c.closeConn()
+		c.closeConnLocked()
 		return nil, err
 	}
 
@@ -100,8 +104,9 @@ func (c *TCPClient) Query(req *packet.DNSPacket) (res *packet.DNSPacket, err err
 		return nil, err
 	}
 
-	if res.Header.RCode != 0 {
-		return nil, fmt.Errorf("query failed: %v", res.Header.RCode)
+	if err := validateResponse(req, res); err != nil {
+		c.closeConnLocked()
+		return nil, err
 	}
 
 	return res, nil
@@ -109,19 +114,18 @@ func (c *TCPClient) Query(req *packet.DNSPacket) (res *packet.DNSPacket, err err
 
 // Close closes the underlying connection.
 func (c *TCPClient) Close() error {
-	return c.closeConn()
-}
-
-func (c *TCPClient) getConn() (net.Conn, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.closeConnLocked()
+}
 
+func (c *TCPClient) getConnLocked() (net.Conn, error) {
 	if c.conn != nil {
 		return c.conn, nil
 	}
 
 	// Plain TCP
-	conn, err := net.Dial("tcp", c.Server)
+	conn, err := net.DialTimeout("tcp", c.Server, c.Timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +133,10 @@ func (c *TCPClient) getConn() (net.Conn, error) {
 	if c.useTLS {
 		// upgrade plain tcp to tls
 		tlsConn := tls.Client(conn, c.tlsConfig)
+		if err := tlsConn.SetDeadline(time.Now().Add(c.Timeout)); err != nil {
+			conn.Close()
+			return nil, err
+		}
 		if err := tlsConn.Handshake(); err != nil {
 			conn.Close()
 			return nil, err
@@ -141,10 +149,7 @@ func (c *TCPClient) getConn() (net.Conn, error) {
 	return conn, nil
 }
 
-func (c *TCPClient) closeConn() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+func (c *TCPClient) closeConnLocked() error {
 	if c.conn != nil {
 		err := c.conn.Close()
 		c.conn = nil

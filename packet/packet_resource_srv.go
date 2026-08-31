@@ -15,11 +15,14 @@ type DNSResourceRecordSRV struct {
 }
 
 // Decode implements DNSResource.
-func (d *DNSResourceRecordSRV) Decode(reader *bytes.Reader, length uint16) {
-	binary.Read(reader, binary.BigEndian, &d.Priority)
-	binary.Read(reader, binary.BigEndian, &d.Weight)
-	binary.Read(reader, binary.BigEndian, &d.Port)
-	d.Target, _ = decodeDomainName(reader)
+func (d *DNSResourceRecordSRV) Decode(reader *bytes.Reader, length uint16) (err error) {
+	for _, value := range []any{&d.Priority, &d.Weight, &d.Port} {
+		if err = binary.Read(reader, binary.BigEndian, value); err != nil {
+			return err
+		}
+	}
+	d.Target, err = decodeDomainName(reader)
+	return err
 }
 
 // Encode implements DNSResource.

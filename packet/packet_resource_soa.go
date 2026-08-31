@@ -40,14 +40,19 @@ type DNSResourceRecordSOA struct {
 	Minimum uint32
 }
 
-func (d *DNSResourceRecordSOA) Decode(reader *bytes.Reader, length uint16) {
-	d.MName, _ = decodeDomainName(reader)
-	d.RName, _ = decodeDomainName(reader)
-	binary.Read(reader, binary.BigEndian, &d.Serial)
-	binary.Read(reader, binary.BigEndian, &d.Refresh)
-	binary.Read(reader, binary.BigEndian, &d.Retry)
-	binary.Read(reader, binary.BigEndian, &d.Expire)
-	binary.Read(reader, binary.BigEndian, &d.Minimum)
+func (d *DNSResourceRecordSOA) Decode(reader *bytes.Reader, length uint16) (err error) {
+	if d.MName, err = decodeDomainName(reader); err != nil {
+		return err
+	}
+	if d.RName, err = decodeDomainName(reader); err != nil {
+		return err
+	}
+	for _, value := range []any{&d.Serial, &d.Refresh, &d.Retry, &d.Expire, &d.Minimum} {
+		if err = binary.Read(reader, binary.BigEndian, value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (d *DNSResourceRecordSOA) Encode() []byte {

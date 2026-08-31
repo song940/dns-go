@@ -4,6 +4,7 @@
 
 - [架构概述](./architecture.md)
 - [请求处理流程](./request-flow.md)
+- [DNS 引擎与运行模式](./engines.md)
 - [测试指南](./testing.md)
 - [API 参考](./api-reference.md)
 - [使用指南](./usage-guide.md)
@@ -18,7 +19,7 @@ dns-go 是一个用 Go 语言实现的 DNS 客户端和服务器库，支持 DNS
 - **DNS 数据包编解码**: 完整的 DNS 协议实现 (RFC 1034/1035)
 - **UDP 客户端/服务器**: 传统 DNS 查询方式
 - **DoH 客户端/服务器**: DNS over HTTPS 支持
-- **多种记录类型**: A, AAAA, CNAME, NS, SOA, TXT, SRV, EDNS 等
+- **多种记录类型**: A、AAAA、CNAME、NS、SOA、MX、TXT、SRV、CAA、DNSSEC、TLSA、SVCB/HTTPS、EDNS 等
 
 ### 项目结构
 
